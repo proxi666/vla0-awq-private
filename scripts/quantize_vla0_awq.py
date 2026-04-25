@@ -28,11 +28,14 @@ from PIL import Image
 from qwen_vl_utils import process_vision_info
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoConfig, Qwen2_5_VLProcessor
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import \
-    Qwen2_5_VLForConditionalGeneration
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VLForConditionalGeneration,
+)
 
 VLA0_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = VLA0_ROOT.parent
+if str(VLA0_ROOT) not in sys.path:
+    sys.path.insert(0, str(VLA0_ROOT))
 LEROBOT_SRC_CANDIDATES = [
     WORKSPACE_ROOT / "lerobot" / "src",
     VLA0_ROOT / "libs" / "RoboVerse" / "libs" / "lerobot" / "src",
@@ -555,7 +558,9 @@ def save_llm_compressor_checkpoint(
     output: Path,
 ) -> None:
     from llmcompressor.transformers.compression.compressed_tensors_utils import (
-        get_model_compressor, update_and_save_recipe)
+        get_model_compressor,
+        update_and_save_recipe,
+    )
 
     compressor = get_model_compressor(
         model=model,

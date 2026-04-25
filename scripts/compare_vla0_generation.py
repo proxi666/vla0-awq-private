@@ -15,6 +15,8 @@ from torch.utils.data import DataLoader
 # 2. Colab clone: /content/vla0/scripts/... and bundled /content/vla0/libs/RoboVerse/libs/lerobot/src
 VLA0_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = VLA0_ROOT.parent
+if str(VLA0_ROOT) not in sys.path:
+    sys.path.insert(0, str(VLA0_ROOT))
 LEROBOT_SRC_CANDIDATES = [
     WORKSPACE_ROOT / "lerobot" / "src",
     VLA0_ROOT / "libs" / "RoboVerse" / "libs" / "lerobot" / "src",
@@ -24,8 +26,7 @@ for lerobot_src in LEROBOT_SRC_CANDIDATES:
         sys.path.insert(0, str(lerobot_src))
         break
 
-from rv_train.train import (get_cfg, get_dataloader,  # noqa: E402
-                            get_pretrained_model)
+from rv_train.train import get_cfg, get_dataloader, get_pretrained_model  # noqa: E402
 
 
 def parse_args():
