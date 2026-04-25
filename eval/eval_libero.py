@@ -5,17 +5,98 @@
 import argparse
 import gc
 import os
+import sys
+from pathlib import Path
 
 import torch
-from roboverse.evals.libero.eval import eval, get_evaluation_tasks  # noqa
 
-from rv_train.train import get_pretrained_model
+VLA0_ROOT = Path(__file__).resolve().parents[1]
+LIBERO_SRC_CANDIDATES = [
+    VLA0_ROOT / "libs" / "LIBERO",
+    VLA0_ROOT / "libs" / "LIBERO" / "libero",
+    VLA0_ROOT.parent / "LIBERO",
+    VLA0_ROOT.parent / "LIBERO" / "libero",
+]
+LEROBOT_SRC_CANDIDATES = [
+    VLA0_ROOT / "libs" / "RoboVerse" / "libs" / "lerobot" / "src",
+    VLA0_ROOT.parent / "lerobot" / "src",
+]
+
+
+def _prepend_first_existing_path(candidates):
+    for candidate in candidates:
+        if candidate.exists():
+            sys.path.insert(0, str(candidate))
+            return candidate
+    return None
+
+
+def build_eval_log_dir(
+    model_path,
+    task_suite_name,
+    task_name,
+    load_mode="bf16",
+    action_horizon=0,
+    amp=False,
+    generate_temperature=0.0,
+    ensemble_prediction=1,
+    ensemble_version=1,
+    ensemble_2_weight=0.5,
+    num_steps=0,
+):
+    log_dir = f"{model_path}"
+    if load_mode != "bf16":
+        log_dir = f"{log_dir}_{load_mode}"
+    if action_horizon != 0:
+        log_dir = f"{log_dir}_ah_{action_horizon}"
+    if amp:
+        log_dir = f"{log_dir}_amp"
+    if generate_temperature > 0:
+        log_dir = f"{log_dir}_gen_temp_{generate_temperature}"
+    if ensemble_prediction > 1:
+        log_dir = f"{log_dir}_ens_pred_{ensemble_prediction}"
+    if ensemble_version > 1:
+        log_dir = f"{log_dir}_ens_ver_{ensemble_version}"
+        if ensemble_version == 2 and ensemble_2_weight != 0.5:
+            log_dir = f"{log_dir}_ens_2_weight_{ensemble_2_weight}"
+    if num_steps > 0:
+        log_dir = f"{log_dir}_num_steps_{num_steps}"
+    log_dir = f"{log_dir}_eval_libero"
+    log_dir = os.path.join(log_dir, task_suite_name)
+    log_dir = os.path.join(log_dir, task_name)
+    return log_dir
+
+
+for libero_src in LIBERO_SRC_CANDIDATES:
+    if libero_src.exists():
+        sys.path.insert(0, str(libero_src))
+        break
+
+_prepend_first_existing_path(LEROBOT_SRC_CANDIDATES)
+
+from roboverse.evals.libero.eval import (eval,  # noqa: E402
+                                         get_evaluation_tasks)
+
+from rv_train.train import get_pretrained_model  # noqa: E402
 
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate model on LIBERO environment")
     parser.add_argument(
         "--model_path", type=str, required=True, help="Path to the model checkpoint"
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda:0",
+        help="Torch device to use for loading and evaluation.",
+    )
+    parser.add_argument(
+        "--load-mode",
+        type=str,
+        default="bf16",
+        choices=["bf16", "int8", "nf4", "awq"],
+        help="Precision / quantized load mode for the checkpoint.",
     )
     parser.add_argument(
         "--task_name",
@@ -79,7 +160,7 @@ def main():
     parser.add_argument(
         "--no-torch-compile",
         action="store_true",
-        help="Use torch.compile for evaluation",
+        help="Disable torch.compile for evaluation",
         default=False,
     )
     parser.add_argument(
@@ -105,7 +186,10 @@ def main():
     ), f"Task {args.task_name} not found in {all_tasks[args.task_suite_name]}"
 
     model, cfg = get_pretrained_model(
-        args.model_path, 0, torch_compile=not args.no_torch_compile
+        args.model_path,
+        args.device,
+        torch_compile=not args.no_torch_compile,
+        load_mode=args.load_mode,
     )
     model.eval()
 
@@ -133,10 +217,12 @@ def main():
     if cfg.EXP.MODEL == "qwen":
         other_args["generate_temperature"] = args.generate_temperature
 
+    device_type = "cuda" if str(args.device).startswith("cuda") else "cpu"
+
     def model_act(*args, **kwargs):
         with torch.no_grad():
             with torch.autocast(
-                device_type="cuda", dtype=torch.bfloat16, enabled=enable_amp
+                device_type=device_type, dtype=torch.bfloat16, enabled=enable_amp
             ):
                 out = model(  # noqa
                     *args,
@@ -147,25 +233,19 @@ def main():
                 )
                 return out
 
-    log_dir = f"{args.model_path}"
-    if args.action_horizon != 0:
-        log_dir = f"{log_dir}_ah_{args.action_horizon}"
-    if args.amp:
-        log_dir = f"{log_dir}_amp"
-    if args.generate_temperature > 0:
-        log_dir = f"{log_dir}_gen_temp_{args.generate_temperature}"
-    if args.ensemble_prediction > 1:
-        log_dir = f"{log_dir}_ens_pred_{args.ensemble_prediction}"
-    if args.ensemble_version > 1:
-        log_dir = f"{log_dir}_ens_ver_{args.ensemble_version}"
-        if args.ensemble_version == 2 and args.ensemble_2_weight != 0.5:
-            log_dir = f"{log_dir}_ens_2_weight_{args.ensemble_2_weight}"
-    if args.num_steps > 0:
-        log_dir = f"{log_dir}_num_steps_{args.num_steps}"
-    log_dir = f"{log_dir}_eval_libero"
-
-    log_dir = os.path.join(log_dir, args.task_suite_name)
-    log_dir = os.path.join(log_dir, args.task_name)
+    log_dir = build_eval_log_dir(
+        model_path=args.model_path,
+        task_suite_name=args.task_suite_name,
+        task_name=args.task_name,
+        load_mode=args.load_mode,
+        action_horizon=args.action_horizon,
+        amp=args.amp,
+        generate_temperature=args.generate_temperature,
+        ensemble_prediction=args.ensemble_prediction,
+        ensemble_version=args.ensemble_version,
+        ensemble_2_weight=args.ensemble_2_weight,
+        num_steps=args.num_steps,
+    )
     os.makedirs(log_dir, exist_ok=True)
 
     eval(

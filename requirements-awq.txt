@@ -1,0 +1,10 @@
+# AWQ quantization tooling for VLA-0.
+#
+# Keep this out of the existing qwen env unless you explicitly want to test
+# dependency interaction there. Prefer cloning qwen to vla0-awq first.
+llmcompressor
+
+# llmcompressor currently resolves torch 2.10.0 in this environment. Keep the
+# vision/audio extension wheels aligned so qwen_vl_utils can import cleanly.
+torchvision==0.25.0
+torchaudio==2.10.0

@@ -227,6 +227,59 @@ class QwenActor(nn.Module):
             raise NotImplementedError(f"Action type {self.action_type} not implemented")
 
     @staticmethod
+    def build_bnb_config(load_mode):
+        if load_mode in ["bf16", "awq"]:
+            return None
+
+        from transformers import BitsAndBytesConfig
+
+        if load_mode == "int8":
+            return BitsAndBytesConfig(load_in_8bit=True)
+
+        if load_mode == "nf4":
+            return BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+        raise ValueError(f" Unsupported load_mode: {load_mode}")
+
+    @staticmethod
+    def resolve_awq_path(path):
+        import os
+
+        if path.endswith(".pth"):
+            base_path = path[:-4]
+        else:
+            base_path = path.rstrip("/")
+
+        if "_awq" in os.path.basename(base_path):
+            awq_path = base_path
+        else:
+            awq_path = f"{base_path}_awq"
+
+        required_hf_files = [
+            "config.json",
+            "tokenizer.json",
+            "preprocessor_config.json",
+        ]
+        missing_hf_files = [
+            filename
+            for filename in required_hf_files
+            if not os.path.exists(os.path.join(awq_path, filename))
+        ]
+        if not os.path.isdir(awq_path) or missing_hf_files:
+            raise FileNotFoundError(
+                "`load_mode='awq'` expects a sibling AWQ checkpoint directory. "
+                f"Requested base path: {base_path}. "
+                f"Expected AWQ path: {awq_path}. "
+                f"Missing files: {missing_hf_files if missing_hf_files else 'directory not found'}. "
+                "Create it first with `scripts/quantize_vla0_awq.py`."
+            )
+        return awq_path
+
+    @staticmethod
     def load_qwen_model(
         qwen_model_id,
         use_lora,
@@ -300,12 +353,14 @@ class QwenActor(nn.Module):
                 min_pixels=min_pixel,
                 max_pixels=max_pixel,
                 padding_side=padding_side,
+                use_fast=False,
             )
         else:
             processor = Qwen2_5_VLProcessor.from_pretrained(
                 qwen_model_id,
                 min_pixels=min_pixel,
                 max_pixels=max_pixel,
+                use_fast=False,
             )
 
         return processor
@@ -724,9 +779,9 @@ class QwenActor(nn.Module):
                 mask_indices = [
                     x + sysuser_len for x in mask_indices
                 ]  # add sysuser_len to the mask indices to get the correct indices of these tokens
-                labels[
-                    i, mask_indices
-                ] = -100  # these elements will not be used for loss calculation
+                labels[i, mask_indices] = (
+                    -100
+                )  # these elements will not be used for loss calculation
                 model_inputs["input_ids"][
                     i, mask_indices
                 ] = 30  # replace the input ids with '?' token id
@@ -756,9 +811,9 @@ class QwenActor(nn.Module):
             if generate_temperature > 0:
                 sample_args["temperature"] = generate_temperature
             else:
-                sample_args[
-                    "do_sample"
-                ] = False  # greedy search, this makes the generation deterministic
+                sample_args["do_sample"] = (
+                    False  # greedy search, this makes the generation deterministic
+                )
 
             if get_one_step_action:
                 # we calculate the max number of tokens to generate for one step of action
@@ -825,8 +880,15 @@ class QwenActor(nn.Module):
         self.model.save_pretrained(path)
         self.processor.save_pretrained(path)
 
-    def from_pretrained(self, path, is_trainable=True):
-        _device = next(self.parameters()).device
+    def from_pretrained(self, path, is_trainable=True, load_mode="bf16", device=None):
+
+        if load_mode != "bf16" and self.use_lora:
+            raise NotImplementedError(
+                "Quantized loading is only implemented for non-LoRA checkpoints for now."
+            )
+
+        target_device = device if device is not None else next(self.parameters()).device
+        target_device = str(target_device)
         # This way works
         del self.model
         torch.cuda.empty_cache()
@@ -859,12 +921,31 @@ class QwenActor(nn.Module):
                 config = AutoConfig.from_pretrained(path)
                 config.attention_dropout = self.attention_dropout
                 extra_kwargs["config"] = config
-            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                path,
-                # device_map={"": "cuda:0"},
-                torch_dtype=torch.bfloat16,
-                **extra_kwargs,
-            )
+            if load_mode == "awq":
+                path = self.resolve_awq_path(path)
+                print("Resolved AWQ checkpoint path to", path)
+            bnb_config = self.build_bnb_config(load_mode)
+
+            if load_mode == "awq":
+                self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    path,
+                    torch_dtype=torch.bfloat16,
+                    device_map={"": target_device},
+                    **extra_kwargs,
+                )
+            elif bnb_config is None:
+                self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    path,
+                    torch_dtype=torch.bfloat16,
+                    **extra_kwargs,
+                )
+            else:
+                self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    path,
+                    quantization_config=bnb_config,
+                    device_map={"": target_device},
+                    **extra_kwargs,
+                )
             print("Loading Qwen2.5 full model from", path)
 
         if self.use_flash_attention_2:
@@ -873,17 +954,20 @@ class QwenActor(nn.Module):
                 min_pixels=self.min_pixel,
                 max_pixels=self.max_pixel,
                 padding_side="left",
+                use_fast=False,
             )
         else:
             self.processor = Qwen2_5_VLProcessor.from_pretrained(
                 path,
                 min_pixels=self.min_pixel,
                 max_pixels=self.max_pixel,
+                use_fast=False,
             )
 
         print("Loading Qwen2.5 processor from", path)
 
-        QwenActor.to(self, _device)
+        if load_mode == "bf16":
+            QwenActor.to(self, target_device)
 
     def to(self, device):
         super().to(device)

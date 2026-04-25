@@ -6,6 +6,7 @@
 import logging
 import warnings
 from functools import cache
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -54,6 +55,25 @@ def is_lerobot_v3():
 print(f"LeRobot version: {get_lerobot_version()}, using v3.0 API: {LEROBOT_V3}")
 
 
+def _build_libero_eval_metadata_fallback():
+    """
+    Build the minimal metadata required to convert live LIBERO observations into
+    RoboVerse format during evaluation.
+
+    This avoids depending on Hugging Face LeRobot dataset metadata for the old
+    `physical-intelligence/libero` repo, which is not compatible with the
+    bundled LeRobot codepath used here.
+    """
+    return SimpleNamespace(
+        camera_keys=("image", "wrist_image"),
+        features={
+            "actions": {"shape": (7,)},
+            "state": {"shape": (8,)},
+        },
+        fps=10,
+    )
+
+
 @cache
 def get_lerobot_metadata(repo_id):
     """
@@ -61,7 +81,16 @@ def get_lerobot_metadata(repo_id):
     :param repo_id: (str) Repository ID from huggingface to load the dataset
     :return: (dict) Metadata for the dataset
     """
-    return LeRobotDatasetMetadata(repo_id=repo_id)
+    try:
+        return LeRobotDatasetMetadata(repo_id=repo_id)
+    except (FileNotFoundError, NotImplementedError) as exc:
+        if repo_id == "physical-intelligence/libero":
+            print(
+                "Warning: Falling back to static LIBERO metadata for "
+                f"{repo_id} during evaluation ({exc})."
+            )
+            return _build_libero_eval_metadata_fallback()
+        raise
 
 
 def get_final_le_cam_list_rv_cam_list(metadata, le_cam_list, rv_cam_list):

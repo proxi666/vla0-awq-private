@@ -71,7 +71,7 @@ def save_checkpoint(name, epoch, model, optimizer, lr_sched, cfg, log_dir):
     print(f"Checkpoint saved to {pth_path}.")
 
 
-def load_model(model, model_path, cfg):
+def load_model(model, model_path, cfg, device=None, load_mode="bf16"):
     """
     Loads a pretrained model from a given path.
     :param model: model to load
@@ -92,7 +92,11 @@ def load_model(model, model_path, cfg):
         print("WARNING: model has from_pretrained method")
         assert model_path[-4:] == ".pth"
         print(f"Loading from {model_path[:-4]}")
-        model_module.from_pretrained(model_path[:-4])
+        model_module.from_pretrained(
+            model_path[:-4],
+            load_mode=load_mode,
+            device=device,
+        )
     else:
         model_module.load_state_dict(checkpoint["model_state"])
 
@@ -114,6 +118,8 @@ def load_model_opt_sched(
     cfg,
     to_load_model=True,
     only_load_model=False,
+    device=None,
+    load_mode="bf16",
 ):
     """
     Loads a pretrained model from a given path.
@@ -125,7 +131,9 @@ def load_model_opt_sched(
     :param to_load_model: whether to load the model from the checkpoint or not
     """
     if to_load_model:
-        model, checkpoint = load_model(model, model_path, cfg)
+        model, checkpoint = load_model(
+            model, model_path, cfg, load_mode=load_mode, device=device
+        )
     else:
         checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
 
@@ -142,7 +150,68 @@ def load_model_opt_sched(
     return model, epoch, optimizer, lr_sched
 
 
-def get_pretrained_model(model_path, device, torch_compile=False):
+def load_model_inference_only(model, model_path, cfg, device=None, load_mode="bf16"):
+    """
+    Loads only the inference artifacts for a pretrained model.
+
+    Unlike `load_model`, this path skips `torch.load(model_last.pth)` and restores
+    directly from the sibling Hugging Face folder, which avoids materializing the
+    large training checkpoint during inference.
+    """
+    if isinstance(model, DDP):
+        model_module = model.module
+    else:
+        model_module = model
+
+    if not hasattr(model_module, "from_pretrained"):
+        raise NotImplementedError(
+            "Inference-only loading requires from_pretrained support"
+        )
+
+    if model_path.endswith(".pth"):
+        pretrained_path = model_path[:-4]
+        log_dir = "/".join(model_path.split("/")[:-1])
+    else:
+        pretrained_path = model_path.rstrip("/")
+        log_dir = "/".join(pretrained_path.split("/")[:-1])
+
+    required_hf_files = [
+        "config.json",
+        "model.safetensors.index.json",
+        "tokenizer.json",
+        "preprocessor_config.json",
+    ]
+    missing_hf_files = [
+        filename
+        for filename in required_hf_files
+        if not os.path.exists(os.path.join(pretrained_path, filename))
+    ]
+    if not os.path.isdir(pretrained_path) or missing_hf_files:
+        raise FileNotFoundError(
+            "Inference-only loading expects the Hugging Face export folder next to the .pth checkpoint. "
+            f"Missing or incomplete directory: {pretrained_path}. "
+            f"Missing files: {missing_hf_files if missing_hf_files else 'directory not found'}. "
+            "Download/copy the full `model_last/` folder, not only `model_last.pth`."
+        )
+
+    print(f"Loading inference artifacts from {pretrained_path}")
+    model_module.from_pretrained(
+        pretrained_path,
+        load_mode=load_mode,
+        device=device,
+    )
+
+    if cfg.EXP.MODEL in ["qwen", "dp", "qwen_dp"]:
+        with open(f"{log_dir}/dataset_stats.pkl", "rb") as f:
+            original_dataset_stats = pkl.load(f)
+            model_module.set_dataset_stats(original_dataset_stats)
+
+    torch.cuda.empty_cache()
+    gc.collect()
+    return model
+
+
+def get_pretrained_model(model_path, device, torch_compile=False, load_mode="bf16"):
     """
     Loads a pretrained model from a given path.
     :param model_path: path to the pretrained model
@@ -156,16 +225,12 @@ def get_pretrained_model(model_path, device, torch_compile=False):
     model = get_model(
         cfg, calculate_dataset_stats=False
     )  # don't calculate dataset stats for pretrained model, its loaded from a checkpoint
-    model.to(device)
-    optimizer, lr_sched = get_optimizer(cfg, model, num_gpus=1)
-
-    model, _, _, _ = load_model_opt_sched(
+    model = load_model_inference_only(
         model=model,
-        optimizer=optimizer,
-        lr_sched=lr_sched,
         model_path=model_path,
         cfg=cfg,
-        only_load_model=True,
+        device=device,
+        load_mode=load_mode,
     )
 
     if torch_compile:
